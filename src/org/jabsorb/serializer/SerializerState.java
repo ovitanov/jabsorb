@@ -198,12 +198,12 @@ public class SerializerState
       throw new UnmarshallException("source object may not be null");
     }
     ProcessedObject p = getProcessedObject(source);
-    if (p == null)
+    if (p != null)
     {
+    	p.setSerialized(target);
       // this should normally never happen- it's a sanity check.
-      throw new UnmarshallException("source object must be already registered as a ProcessedObject " + source);
+      //throw new UnmarshallException("source object must be already registered as a ProcessedObject " + source);
     }
-    p.setSerialized(target);
   }
 
   /**

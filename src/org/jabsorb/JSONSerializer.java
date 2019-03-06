@@ -30,6 +30,7 @@ import java.io.IOException;
 import java.io.ObjectInputStream;
 import java.io.Serializable;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
@@ -37,6 +38,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.NoSuchElementException;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 import org.jabsorb.serializer.MarshallException;
 import org.jabsorb.serializer.ObjectMatch;
@@ -104,6 +108,9 @@ public class JSONSerializer implements Serializable
    * smaller size of marshalled String.
    */
   private boolean marshallClassHints = true;
+  
+  /** Add ability to marshall class hint only for a given thread*/
+  private Map<Thread, Integer> forceMarshallClassHints = new ConcurrentHashMap<>();
 
   /**
    * Should attributes will null values still be included in the serialized JSON
@@ -135,12 +142,13 @@ public class JSONSerializer implements Serializable
    * The list of class types that are considered primitives
    * that should not be fixed up when fixupDuplicatePrimitives is false.
    */
-  protected static Class[] duplicatePrimitiveTypes =
-  {
+  protected static final Set<Class<?>> duplicatePrimitiveTypes = Stream.of(
     String.class, Integer.class, Boolean.class, Long.class,
     Byte.class, Double.class, Float.class, Short.class
-  };
-
+  ).collect(Collectors.toSet());
+  
+  protected static Set<Class<?>> notCacheableTypes = Collections.emptySet();
+  
   /**
    * Determine if this serializer considers the given Object to be a primitive
    * wrapper type Object.  This is used to determine which types of Objects
@@ -156,16 +164,11 @@ public class JSONSerializer implements Serializable
       return true;  // extra safety check- null is considered primitive too
     }
 
-    Class c = o.getClass();
-
-    for (int i=0,j=duplicatePrimitiveTypes.length; i<j; i++)
-    {
-      if (duplicatePrimitiveTypes[i] == c)
-      {
-        return true;
-      }
-    }
-    return false;
+    return duplicatePrimitiveTypes.contains(o.getClass());
+  }
+  
+  public static synchronized void setNotCacheableTypes(Set<Class<?>> notCacheableTypes) {
+	  JSONSerializer.notCacheableTypes = notCacheableTypes;
   }
 
   /**
@@ -273,7 +276,11 @@ public class JSONSerializer implements Serializable
    */
   public boolean getMarshallClassHints()
   {
-    return marshallClassHints;
+    if (marshallClassHints) {
+    	return true;
+    }
+    Integer forceMarshallHintsLevel = forceMarshallClassHints.get(Thread.currentThread());
+    return null == forceMarshallHintsLevel ? marshallClassHints : forceMarshallHintsLevel > 0;
   }
 
   /**
@@ -480,6 +487,18 @@ public class JSONSerializer implements Serializable
   {
     this.marshallClassHints = marshallClassHints;
   }
+  
+  public void pushForceMarshallClassHints()
+  {
+    Integer forceClassHintsLevel = this.forceMarshallClassHints.get(Thread.currentThread());
+    this.forceMarshallClassHints.put(Thread.currentThread(), null == forceClassHintsLevel ? 1 : forceClassHintsLevel+1);
+  }
+  
+  public void popForceMarshallClassHints()
+  {
+    Integer forceClassHintsLevel = this.forceMarshallClassHints.get(Thread.currentThread());
+    this.forceMarshallClassHints.put(Thread.currentThread(), null == forceClassHintsLevel ? -1 : forceClassHintsLevel-1);
+  }
 
   /**
    * Returns true if attributes will null values should still be included in the
@@ -545,22 +564,22 @@ public class JSONSerializer implements Serializable
   public ObjectMatch tryUnmarshall(SerializerState state, Class clazz,
       Object json) throws UnmarshallException
   {
-    // check for duplicate objects or circular references
-    ProcessedObject p = state.getProcessedObject(json);
 
-    // if this object hasn't been seen before, mark it as seen and continue forth
-
-    if (p == null)
-    {
-      p = state.store(json);
+    if (!notCacheableTypes.contains(clazz) && (null == json || !notCacheableTypes.contains(json.getClass()))) {
+        // check for duplicate objects or circular references
+        ProcessedObject p = state.getProcessedObject(json);
+        // if this object hasn't been seen before, mark it as seen and continue forth
+    	if (p == null)
+        {
+          state.store(json);
+        }
+        else
+        {
+          // get original serialized version
+          // to recreate circular reference / duplicate object on the java side
+          return (ObjectMatch) p.getSerialized();
+        }
     }
-    else
-    {
-      // get original serialized version
-      // to recreate circular reference / duplicate object on the java side
-      return (ObjectMatch) p.getSerialized();
-    }
-
     /*
      * If we have a JSON object class hint that is a sub class of the signature
      * 'clazz', then override 'clazz' with the hint class.
@@ -629,20 +648,17 @@ public class JSONSerializer implements Serializable
   public Object unmarshall(SerializerState state, Class clazz, Object json)
       throws UnmarshallException
   {
-    // check for duplicate objects or circular references
-    ProcessedObject p = state.getProcessedObject(json);
+    if (!notCacheableTypes.contains(clazz) && (null == json || !notCacheableTypes.contains(json.getClass()))) {
+      // check for duplicate objects or circular references
+      ProcessedObject p = state.getProcessedObject(json);
 
-    // if this object hasn't been seen before, mark it as seen and continue forth
-
-    if (p == null)
-    {
-      p = state.store(json);
-    }
-    else
-    {
-      // get original serialized version
-      // to recreate circular reference / duplicate object on the java side
-      return p.getSerialized();
+      // if this object hasn't been seen before, mark it as seen and continue forth
+      if (p == null) {
+        p = state.store(json);
+      } else {
+        // get original serialized version to recreate circular reference / duplicate object on the java side
+        return p.getSerialized();
+      }
     }
 
     // If we have a JSON object class hint that is a sub class of the
@@ -717,7 +733,7 @@ public class JSONSerializer implements Serializable
    *           the javaClass hint if the type of Object passed in is not
    *           JSONObject|JSONArray.
    */
-  protected Class getClassFromHint(Object o) throws UnmarshallException
+  private Class getClassFromHint(Object o) throws UnmarshallException
   {
     if (o == null)
     {
